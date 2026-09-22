@@ -124,7 +124,7 @@ steps:
       # token-id equality vs. the baseline for the hot pass and for a warm
       # replay served from LMCache, with vLLM's preemption counter as the
       # witness.
-      - label: ":compression: preemption_correctness / {{matrix.mode}}"
+      - label: ":compression: preemption_correctness / {{matrix.mode}} / async={{matrix.async_scheduling}}"
         command: |
           case "{{matrix.mode}}" in
             lmcache_driven) ;;
@@ -139,9 +139,13 @@ steps:
             mode:
               - "lmcache_driven"
               - "engine_driven"
+            async_scheduling:
+              - "0"
+              - "1"
         timeout_in_minutes: 40
         env:
           LMCACHE_REQUEST_TRANSPORT: "zmq"
+          ASYNC_SCHEDULING: "{{matrix.async_scheduling}}"
           NUM_GPU_BLOCKS_OVERRIDE: "2048"
           MAX_NUM_SEQS: "128"
           MAX_MODEL_LEN: "4096"

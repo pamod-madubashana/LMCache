@@ -454,6 +454,26 @@ The same ladder against the engine-driven transfer mode (2 repeats, 95 to
 request diverging at output token 49 to the reference's runner-up at a
 top-1/top-2 gap of 0.008 nats, classified as a near-tie.
 
+With `--async-scheduling` on both servers (2 rounds each, seed 21):
+
+| Mode | Preemptions per hot pass (baseline: 51) | Hot wall (baseline 15.5 s) | Divergent | Replay hit |
+|---|---|---|---|---|
+| lmcache-driven | 655, 547 | 17.9 s, 17.4 s | 0 hard, 1 near-tie (gap 0.008) | 0.92 |
+| engine-driven | 583, 580 | 29.2 s, 28.0 s | 0 hard, 1 near-tie (gap 0.008) | 0.92 |
+
+Correctness holds under async scheduling, but the LMCache server preempts
+about ten times as often as the baseline, against roughly 1.5× in sync mode,
+and the engine-driven hot pass is 1.8× slower. This is vLLM behaviour, not
+the connector's: with async scheduling and a consumer-role connector vLLM
+defers block frees to the end of the in-flight step (`defer_block_free`),
+but the 0.28.1 scheduler still walks down the running list preempting
+victims whose blocks cannot yet be reused, so one shortfall cascades into
+many preemptions with no progress. vLLM fixed this in #49675 ("Stop
+zero-progress preemption cascades for deferred KV frees", 2026-09-11) by
+stopping the loop when the victim's blocks would be deferred. Any consumer
+connector on a pre-#49675 vLLM sees the same cascade; the k3 pin should be
+checked against that commit before async scheduling is enabled in CI.
+
 Oracle note: with **random-token** prompts the same setup showed 1/64 A/A
 and 3/64 LMCache divergences, all at near-ties in a flat next-token
 distribution. Real-text prompts plus the top-2 logprob classifier
