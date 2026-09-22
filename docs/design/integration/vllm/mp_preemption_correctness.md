@@ -480,6 +480,29 @@ distribution. Real-text prompts plus the top-2 logprob classifier
 (`--near-tie-gap`) remove that noise; the script reports the A/A floor
 alongside every run so a future divergence can be read against it.
 
+Where the noise comes from (measured 2026-09-22, plain vLLM against itself,
+64-way vs 4-way concurrency, random-token prompts, `VLLM_BATCH_INVARIANT=1`,
+three seeds per cell):
+
+| Model | dtype | eager | cudagraph |
+|---|---|---|---|
+| facebook/opt-125m | fp16 | 1/64 flips in 1 of 3 seeds | 1/64 flips in 2 of 3 seeds |
+| facebook/opt-125m | bf16 | – | 2/64 flips in every seed, one exact tie misclassified as hard |
+| Qwen/Qwen3-1.7B | bf16 | 0 in 3 seeds | 0 in 3 seeds |
+
+vLLM's batch-invariant mode replaces the kernels it knows about: GEMMs
+(Triton on Ampere; cuBLASLt with split-K disabled on Hopper/Blackwell),
+`bmm`, softmax, `mean`, its own `RMSNorm`, attention split counts
+(FlashAttention 3 and Triton; FA4 is refused; FlashInfer pinned splits;
+FlexAttention fixed tiles), MoE kernels that declare support, and TP
+collectives (tree all-reduce, one NCCL channel). Its documented tested list
+is RMSNorm-based: Qwen3 dense and MoE, Qwen2.5, Qwen3-VL, Llama 3.x,
+Mistral, Phi-3.5, Granite 3.1, gpt-oss, DeepSeek V3/R1 (MLA), EXAONE 4.0,
+OLMo 2. OPT uses `nn.LayerNorm`, which is outside that set, and the data
+above shows dtype and eager mode are not the cause. Use Qwen3-1.7B as the
+fast model for exact-match runs; keep the near-tie classifier for anything
+not on vLLM's list.
+
 ### 8.4 Still open
 
 - T1 numbers on a production-size model (the k3 `preemption_correctness`
