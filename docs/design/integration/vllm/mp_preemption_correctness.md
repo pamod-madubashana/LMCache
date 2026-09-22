@@ -311,26 +311,39 @@ Forcing preemption deterministically:
 - `--num-gpu-blocks-override N` instead of `--gpu-memory-utilization 0.4`
   (pool size independent of the GPU model).
 - Workload: `ignore_eos: true`, fixed `max_tokens`, temperature 0, prompts of
-  several chunks with **shared prefixes across requests** (so a poisoned
-  chunk is re-hit), concurrency ≥ `max_num_seqs`. Total demand
+  several chunks, concurrency ≥ `max_num_seqs`. Total demand
   `Σ(prompt + max_tokens)` chosen to exceed `N · block_size` by ≥ 2×, so
-  preemption is guaranteed rather than probabilistic.
+  preemption is guaranteed rather than probabilistic. Two workloads are
+  needed, because they fail differently:
+  - **unique prefixes** — every prompt carries a tag drawn from a disjoint
+    slice of the token pool, so no two prompts share a chunk-aligned
+    prefix. Any LMCache load is then attributable: the only KV a request
+    can hit is KV it stored itself before being preempted. This is the
+    ownership/lifecycle test.
+  - **shared prefixes across requests** — a poisoned chunk is re-hit by
+    other requests, and the load overlaps the vLLM prefix cache
+    (`skip_first_n_tokens`). This is the reuse/overlap test.
 - Assert preemption count from vLLM's `/metrics`
   `vllm:num_preemptions_total` (the connector under test must not be its
   own witness).
 
-Passes, all with the same request set and client-supplied `request_id`:
+Passes, all with the same request set and client-supplied `request_id`, run
+for each scheduler mode (regular and async):
 
-| Pass | Server | Concurrency | Purpose |
-|---|---|---|---|
-| 0 | vLLM, no LMCache | same as pass 1 | baseline token ids |
-| 1 | vLLM + LMCache MP, cold cache | high (preemption-heavy) | P4 for preempted requests; populates cache under stress |
-| 2 | same server as 1, warm | 1–4 (no preemption) | **P3/P4 replay**: everything loads from the cache written in pass 1 |
+| Pass | Server | Workload | Concurrency | Purpose |
+|---|---|---|---|---|
+| 1 | vLLM, no LMCache | both | high, then low | baseline token ids under preemption, plus an A/A noise floor |
+| 2 | vLLM + LMCache MP, cold cache | unique | high (preemption-heavy) | **ownership**: P4 for preempted requests, with every load attributable to the request that stored it |
+| 3 | same server, warm | shared | high (preemption-heavy) | **reuse/overlap**: cross-request prefix reuse and APC overlap while preemption runs |
+| 4 | same server, warm | shared | low (no preemption) | **P3/P4 replay**: everything loads from the cache written in pass 3 |
 
-Pass 2 must also assert a high hit ratio via `cached_token_stats` in
-`kv_transfer_params` (the connector already returns
-`num_lmcache_cached_tokens`), otherwise the pass proves nothing about cache
-content.
+Pass 2 must assert that preemption actually happened and that at least one
+request loaded from LMCache, otherwise it degrades into a no-op. Pass 4 must
+assert a high hit ratio via `cached_token_stats` in `kv_transfer_params` (the
+connector already returns `num_lmcache_cached_tokens`), otherwise the pass
+proves nothing about cache content. Every pass also asserts that the server
+drains to idle and that every request stops on `length`, so a truncated
+output cannot match trivially.
 
 Oracle: compare **token ids**, not text (use `return_token_ids` or
 `logprobs` with `top_logprobs=0`). With `VLLM_BATCH_INVARIANT=1` (already the
@@ -438,45 +451,62 @@ still observes poisoning, so the oracle is sensitive.
 L2 (1 GPU, real server, both transfer modes): store → `handle_preemptions`
 → overwrite → lookup → retrieve returns the original KV bit-for-bit.
 
-L3 on this host (facebook/opt-125m, `--num-gpu-blocks-override 256`,
-64 requests × up to 768 tokens against a 4096-token pool,
-`VLLM_BATCH_INVARIANT=1`):
+L3 on this host (`Qwen/Qwen3-1.7B`, `VLLM_BATCH_INVARIANT=1`,
+`--num-gpu-blocks-override 256` = a 4096-token pool, `--max-num-seqs 64`,
+`--max-model-len 2048`, LMCache chunk size 64; 64 requests, prompts of
+256–512 tokens, `max_tokens 256`, `ignore_eos`, so about 40 300 tokens of
+demand against the pool, ~9.8× oversubscribed; seed 31, the shared-prefix
+hot/replay pair repeated twice). All four configurations pass with **zero
+divergent requests — no near-ties, no hard mismatches — in every pass**, and
+the baseline A/A floor is 0 for both workloads in all four:
 
-| Pass | Requests | Preemptions | Divergent vs baseline | LMCache hit fraction |
-|---|---|---|---|---|
-| baseline (hot) | 64 | 62 | reference | – |
-| baseline (replay concurrency, A/A floor) | 64 | 0 | 0 | – |
-| lmcache hot (cold cache) | 64 | 71 | 0 | – |
-| lmcache replay | 64 | 0 | 0 | 0.91 of prompt tokens |
+| Scheduler | Mode | Pass | Preemptions (baseline) | Requests served by LMCache | Divergent | Wall vs baseline |
+|---|---|---|---|---|---|---|
+| regular | lmcache-driven | unique hot | 50 (36) | 35/64 | 0 | −5.3 % |
+| | | shared hot | 88, 91 (68) | 47/64, 64/64 | 0 | −2.3 %, −1.0 % |
+| | | shared replay | 0 (0) | 64/64, hit 0.92 | 0 | – |
+| regular | engine-driven | unique hot | 56 (36) | 35/64 | 0 | +74.2 % |
+| | | shared hot | 95, 80 (70) | 48/64, 64/64 | 0 | +88.2 %, +58.5 % |
+| | | shared replay | 0 (0) | 64/64, hit 0.92 | 0 | – |
+| async | lmcache-driven | unique hot | 275 (38) | 60/64 | 0 | +13.0 % |
+| | | shared hot | 562, 532 (57) | 62/64, 64/64 | 0 | +29.1 %, +26.1 % |
+| | | shared replay | 0 (0) | 64/64, hit 0.92 | 0 | – |
+| async | engine-driven | unique hot | 352 (38) | 64/64 | 0 | +409.6 % |
+| | | shared hot | 622, 702 (63) | 64/64 | 0 | +444.1 %, +468.0 % |
+| | | shared replay | 0 (0) | 64/64, hit 0.92 | 0 | – |
 
-The same ladder against the engine-driven transfer mode (2 repeats, 95 to
-103 preemptions per hot pass, 0.92 replay hit fraction) passed with one
-request diverging at output token 49 to the reference's runner-up at a
-top-1/top-2 gap of 0.008 nats, classified as a near-tie.
+The unique-prefix pass is the one that proves the feature: the cache is cold,
+no two prompts share a chunk-aligned prefix, and 35 to 64 of the 64 requests
+still load KV from LMCache. Each of those loads can only be that request
+reading back KV it stored before it was preempted, and the output is
+bit-identical to a baseline run that never preempted it. Before this branch
+the same pass loaded nothing — the connector returned early for
+`PREEMPTED` requests — so a resumed request recomputed its whole prefix.
 
-With `--async-scheduling` on both servers (2 rounds each, seed 21):
+The shared-prefix pass adds cross-request reuse on top: the loads there
+overlap the vLLM prefix cache (about 11 000 of 24 000 prompt tokens hit APC),
+so the connector has to place a partial load with the right
+`skip_first_n_tokens` while preemption is running. The replay pass reads
+92 % of its prompt tokens out of KV written by the preceding hot pass, with
+no preemption of its own, which is what pins P3.
 
-| Mode | Preemptions per hot pass (baseline: 51) | Hot wall (baseline 15.5 s) | Divergent | Replay hit |
-|---|---|---|---|---|
-| lmcache-driven | 655, 547 | 17.9 s, 17.4 s | 0 hard, 1 near-tie (gap 0.008) | 0.92 |
-| engine-driven | 583, 580 | 29.2 s, 28.0 s | 0 hard, 1 near-tie (gap 0.008) | 0.92 |
-
-Correctness holds under async scheduling, but the LMCache server preempts
-about ten times as often as the baseline, against roughly 1.5× in sync mode,
-and the engine-driven hot pass is 1.8× slower. This is vLLM behaviour, not
+Preemption counts scale with how much LMCache lengthens each step: the
+connector runs 1.4–1.6× the baseline's preemptions in regular mode, but 7–11×
+in async mode, and the async engine-driven configuration is 4.5–5.7× slower
+than its baseline. Correctness holds throughout, and the cause is vLLM's, not
 the connector's: with async scheduling and a consumer-role connector vLLM
-defers block frees to the end of the in-flight step (`defer_block_free`),
-but the 0.28.1 scheduler still walks down the running list preempting
-victims whose blocks cannot yet be reused, so one shortfall cascades into
-many preemptions with no progress. vLLM fixed this in #49675 ("Stop
-zero-progress preemption cascades for deferred KV frees", 2026-09-11) by
-stopping the loop when the victim's blocks would be deferred. Any consumer
-connector on a pre-#49675 vLLM sees the same cascade; the k3 pin should be
-checked against that commit before async scheduling is enabled in CI.
+defers block frees to the end of the in-flight step (`defer_block_free`), but
+the 0.28.1 scheduler still walks down the running list preempting victims
+whose blocks cannot yet be reused, so one shortfall cascades into many
+preemptions with no progress. vLLM fixed this in #49675 ("Stop zero-progress
+preemption cascades for deferred KV frees", 2026-09-11) by stopping the loop
+when the victim's blocks would be deferred. Any consumer connector on a
+pre-#49675 vLLM sees the same cascade; the k3 pin should be checked against
+that commit before async scheduling is enabled in CI.
 
-Oracle note: with **random-token** prompts the same setup showed 1/64 A/A
-and 3/64 LMCache divergences, all at near-ties in a flat next-token
-distribution. Real-text prompts plus the top-2 logprob classifier
+Oracle note: an earlier run of this ladder on `facebook/opt-125m` with
+**random-token** prompts showed 1/64 A/A and 3/64 LMCache divergences, all at
+near-ties in a flat next-token distribution. Real-text prompts plus the top-2 logprob classifier
 (`--near-tie-gap`) remove that noise; the script reports the A/A floor
 alongside every run so a future divergence can be read against it.
 
