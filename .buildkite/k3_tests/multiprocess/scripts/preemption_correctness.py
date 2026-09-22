@@ -1,24 +1,37 @@
 # SPDX-License-Identifier: Apache-2.0
-"""End-to-end preemption correctness ladder (T0-T3 in the preemption TDD).
+"""End-to-end preemption correctness ladder for the LMCache MP connector.
 
 Drives two OpenAI-compatible vLLM servers -- a baseline without LMCache and
-one with the LMCache MP connector -- through the same token-id workload and
-compares generated token ids exactly.
+one with ``LMCacheMPConnector`` -- through the same token-id workloads and
+compares generated token ids exactly.  Run it once per scheduler mode
+(regular and async scheduling) and per transfer mode; the servers must be
+started by the caller with ``VLLM_BATCH_INVARIANT=1`` on a model vLLM's
+batch-invariant mode is validated for.
 
-Passes:
-  0. baseline, high concurrency          -> reference token ids
-  1. lmcache, cold cache, high concurrency -> T0 (no crash / no wedge) and
-                                              T2 (preempted requests match)
-  2. lmcache, warm cache, low concurrency  -> T3 (everything stored during the
-                                              preemption storm is intact)
+Two workloads, because they prove different things:
 
-Preemption is asserted from vLLM's own ``/metrics`` counter, never from the
-connector's log.  Prompts are lists of token ids with shared prefixes so a
-corrupted chunk is re-hit by other requests, and generation uses
-``ignore_eos`` with a fixed ``max_tokens`` so KV demand is deterministic.
+* **unique**: every prompt starts with its own 64-token tag, so no two
+  requests share a single LMCache chunk key.  On a cold cache, any LMCache hit
+  during the high-concurrency pass can only be a preempted request loading
+  the KV it stored itself.  Proves preempt -> store -> resume/load ownership.
+* **shared**: a few 192-token prefixes shared by many requests, so the
+  connector must reconcile vLLM's own prefix cache with LMCache
+  (``skip_first_n_tokens``) and a corrupted chunk is re-read by other
+  requests.  Proves cross-request reuse under preemption.
 
-The workload must overflow the KV pool by arithmetic: run the server with
-``--num-gpu-blocks-override N`` and choose
+Passes, in order:
+
+  1. baseline, high concurrency, both workloads  -> reference token ids
+     (+ top-2 logprobs) and the A/A noise floor at low concurrency
+  2. lmcache, unique workload, high concurrency  -> preemption + resume-load
+  3. lmcache, shared workload, high concurrency  -> reuse/overlap under preemption
+  4. lmcache, shared workload, low concurrency   -> warm-cache integrity: every
+     request must load what pass 3 stored
+  (3 and 4 repeat ``--repeats`` times)
+
+Preemption is asserted from vLLM's own ``/metrics`` counter.  Prompts are
+token ids with ``ignore_eos`` and a fixed ``max_tokens`` so KV demand is
+deterministic; run the servers with ``--num-gpu-blocks-override N`` such that
 ``concurrency * (prompt + max_tokens) >> N * block_size``.
 """
 
@@ -39,6 +52,23 @@ from pathlib import Path
 import aiohttp
 
 PREEMPTION_METRIC = "vllm:num_preemptions_total"
+RUNNING_METRIC = "vllm:num_requests_running"
+WAITING_METRIC = "vllm:num_requests_waiting"
+# Connector prefix-cache counters: vLLM records them per admission, so
+# re-admissions after preemption are included.
+EXTERNAL_QUERIES_METRIC = "vllm:external_prefix_cache_queries_total"
+EXTERNAL_HITS_METRIC = "vllm:external_prefix_cache_hits_total"
+LOCAL_QUERIES_METRIC = "vllm:prefix_cache_queries_total"
+LOCAL_HITS_METRIC = "vllm:prefix_cache_hits_total"
+TRACKED_METRICS = (
+    EXTERNAL_QUERIES_METRIC,
+    EXTERNAL_HITS_METRIC,
+    LOCAL_QUERIES_METRIC,
+    LOCAL_HITS_METRIC,
+)
+# One LMCache chunk; the unique-workload tag must cover at least one so the
+# very first chunk key already differs between requests.
+TAG_TOKENS = 64
 
 
 @dataclass
@@ -68,7 +98,10 @@ class PassResult:
     completions: dict[str, Completion] = field(default_factory=dict)
     preemptions_before: float = 0.0
     preemptions_after: float = 0.0
+    metrics_before: dict[str, float] = field(default_factory=dict)
+    metrics_after: dict[str, float] = field(default_factory=dict)
     wall_s: float = 0.0
+    drained: bool = True
 
     @property
     def preemptions(self) -> float:
@@ -77,6 +110,19 @@ class PassResult:
     @property
     def errors(self) -> list[Completion]:
         return [c for c in self.completions.values() if c.error]
+
+    @property
+    def not_length_capped(self) -> list[Completion]:
+        return [
+            c
+            for c in self.completions.values()
+            if not c.error and c.finish_reason != "length"
+        ]
+
+    def delta(self, metric: str) -> float:
+        return self.metrics_after.get(metric, float("nan")) - self.metrics_before.get(
+            metric, float("nan")
+        )
 
 
 _TEXT = (
@@ -112,8 +158,8 @@ def _text_token_pool(model: str, need: int) -> list[int] | None:
     ids: list[int] = []
     paragraph = 0
     while len(ids) < need:
-        # Vary the paragraph slightly so repeated text does not create
-        # spurious shared prefixes between unrelated requests.
+        # Vary the paragraph so repeated text does not create spurious
+        # shared prefixes between unrelated requests.
         ids.extend(
             tok.encode(f"Section {paragraph}. " + _TEXT, add_special_tokens=False)
         )
@@ -121,44 +167,77 @@ def _text_token_pool(model: str, need: int) -> list[int] | None:
     return ids
 
 
-def build_workload(
-    *,
-    model: str,
-    num_requests: int,
-    prompt_min: int,
-    prompt_max: int,
-    max_tokens: int,
-    num_shared_prefixes: int,
-    shared_prefix_len: int,
-    vocab: int,
-    seed: int,
-) -> list[Prompt]:
-    """Token-id prompts: a shared prefix (one of a few) plus a unique tail.
+@dataclass
+class WorkloadSpec:
+    name: str
+    num_requests: int
+    prompt_min: int
+    prompt_max: int
+    max_tokens: int
+    num_shared_prefixes: int
+    shared_prefix_len: int
+    vocab: int
+    seed: int
 
-    Prompts are slices of real prose when the model's tokenizer can be
-    loaded; natural text has peaked next-token distributions, which keeps
-    numerical near-ties (and therefore benign divergences) rare.  Random
-    token ids are the fallback.
+
+def build_workload(model: str, spec: WorkloadSpec) -> list[Prompt]:
+    """Token-id prompts from real prose (random ids if no tokenizer).
+
+    ``num_shared_prefixes == 0`` builds the *unique* workload: each prompt
+    starts with a request-specific ``TAG_TOKENS``-long tag drawn from a
+    request-specific pool region, so no two requests (and no two seeds)
+    share their first chunk and therefore no LMCache chunk key.  Otherwise
+    ``num_shared_prefixes`` prefixes of ``shared_prefix_len`` tokens are shared
+    round-robin across requests.
     """
-    rng = random.Random(seed)
-    pool = _text_token_pool(
-        model, need=num_requests * prompt_max + shared_prefix_len * 4
+    rng = random.Random(spec.seed)
+    need = (
+        spec.num_requests * (spec.prompt_max + TAG_TOKENS) + spec.shared_prefix_len * 4
     )
+    pool = _text_token_pool(model, need=need)
 
     def draw(n: int) -> list[int]:
         if pool is None:
-            return [rng.randrange(10, vocab) for _ in range(n)]
+            return [rng.randrange(10, spec.vocab) for _ in range(n)]
         start = rng.randrange(0, max(1, len(pool) - n))
         return pool[start : start + n]
 
-    prefixes = [draw(shared_prefix_len) for _ in range(num_shared_prefixes)]
     prompts = []
-    for i in range(num_requests):
-        total = rng.randint(prompt_min, prompt_max)
-        prefix = prefixes[i % num_shared_prefixes]
-        tail = draw(max(1, total - len(prefix)))
-        prompts.append(Prompt(f"preempt-{seed}-{i}", prefix + tail, max_tokens))
-    print("prompt source:", "random token ids" if pool is None else "tokenized prose")
+    if spec.num_shared_prefixes > 0:
+        prefixes = [
+            draw(spec.shared_prefix_len) for _ in range(spec.num_shared_prefixes)
+        ]
+        for i in range(spec.num_requests):
+            total = rng.randint(spec.prompt_min, spec.prompt_max)
+            prefix = prefixes[i % spec.num_shared_prefixes]
+            tail = draw(max(1, total - len(prefix)))
+            prompts.append(
+                Prompt(f"{spec.name}-{spec.seed}-{i}", prefix + tail, spec.max_tokens)
+            )
+    else:
+        for i in range(spec.num_requests):
+            total = rng.randint(spec.prompt_min, spec.prompt_max)
+            # Deterministic, request- and seed-specific first chunk: real
+            # tokens from a disjoint pool slice when possible, so the model
+            # still sees text rather than noise.
+            if pool is not None and len(pool) >= (i + 2) * TAG_TOKENS:
+                base = (
+                    (spec.seed * spec.num_requests + i)
+                    * TAG_TOKENS
+                    % (len(pool) - TAG_TOKENS)
+                )
+                tag = pool[base : base + TAG_TOKENS]
+            else:
+                tag = [
+                    10 + (spec.seed * 100_003 + i * 1_009 + k) % (spec.vocab - 10)
+                    for k in range(TAG_TOKENS)
+                ]
+            tail = draw(max(1, total - TAG_TOKENS))
+            prompts.append(
+                Prompt(f"{spec.name}-{spec.seed}-{i}", tag + tail, spec.max_tokens)
+            )
+    src = "random token ids" if pool is None else "tokenized prose"
+    print(f"workload {spec.name}: {len(prompts)} prompts, source={src}")
     return prompts
 
 
@@ -175,6 +254,18 @@ def scrape_metric(base_url: str, name: str) -> float:
             total += float(line.rsplit(" ", 1)[1])
             found = True
     return total if found else float("nan")
+
+
+def wait_for_drain(base_url: str, timeout_s: float = 30.0) -> bool:
+    """True once the server reports no running and no waiting requests."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        running = scrape_metric(base_url, RUNNING_METRIC)
+        waiting = scrape_metric(base_url, WAITING_METRIC)
+        if running == 0 and waiting == 0:
+            return True
+        time.sleep(0.5)
+    return False
 
 
 async def _one(
@@ -253,6 +344,7 @@ async def run_pass(
 ) -> PassResult:
     result = PassResult(name=name)
     result.preemptions_before = scrape_metric(url, PREEMPTION_METRIC)
+    result.metrics_before = {m: scrape_metric(url, m) for m in TRACKED_METRICS}
     sem = asyncio.Semaphore(concurrency)
     timeout = aiohttp.ClientTimeout(total=3600)
     start = time.monotonic()
@@ -266,6 +358,8 @@ async def run_pass(
             result.completions[c.request_id] = c
     result.wall_s = time.monotonic() - start
     result.preemptions_after = scrape_metric(url, PREEMPTION_METRIC)
+    result.metrics_after = {m: scrape_metric(url, m) for m in TRACKED_METRICS}
+    result.drained = wait_for_drain(url)
     return result
 
 
@@ -338,7 +432,7 @@ def compare(
 def summarize(result: PassResult) -> str:
     n = len(result.completions)
     errors = len(result.errors)
-    lengths = [c.finish_reason == "length" for c in result.completions.values()]
+    lengths = sum(c.finish_reason == "length" for c in result.completions.values())
     cached = [
         c.lmcache_cached_tokens
         for c in result.completions.values()
@@ -348,11 +442,21 @@ def summarize(result: PassResult) -> str:
     p99 = lat[int(0.99 * (len(lat) - 1))] if lat else float("nan")
     cache_line = ""
     if cached:
-        cache_line = f" lmcache_cached_tokens(mean)={sum(cached) / len(cached):.1f}"
+        served = sum(1 for c in cached if c > 0)
+        cache_line = (
+            f"\n    LMCache-served requests: {served}/{len(cached)}, "
+            f"mean served tokens {sum(cached) / len(cached):.0f}"
+        )
+    ext_hits = result.delta(EXTERNAL_HITS_METRIC)
+    ext_queries = result.delta(EXTERNAL_QUERIES_METRIC)
+    loc_hits = result.delta(LOCAL_HITS_METRIC)
+    loc_queries = result.delta(LOCAL_QUERIES_METRIC)
     return (
-        f"[{result.name}] requests={n} errors={errors} finish=length:{sum(lengths)} "
+        f"[{result.name}] requests={n} errors={errors} finish=length:{lengths} "
         f"preemptions={result.preemptions:.0f} wall={result.wall_s:.1f}s "
-        f"p99_latency={p99:.2f}s{cache_line}"
+        f"p99_latency={p99:.2f}s drained={result.drained}{cache_line}\n"
+        f"    prefix-cache tokens: vLLM APC {loc_hits:.0f}/{loc_queries:.0f}, "
+        f"LMCache {ext_hits:.0f}/{ext_queries:.0f} (queries include re-admissions)"
     )
 
 
@@ -371,17 +475,13 @@ def main() -> int:
     ap.add_argument("--shared-prefix-len", type=int, default=192)
     ap.add_argument("--vocab", type=int, default=30000)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--repeats", type=int, default=1, help="hot+replay rounds")
+    ap.add_argument("--repeats", type=int, default=1, help="shared hot+replay rounds")
     ap.add_argument(
         "--min-replay-hit-fraction",
         type=float,
         default=0.8,
-        help="replay pass must report at least this fraction of prompt tokens "
-        "as served from LMCache, else the pass proves nothing",
-    )
-    ap.add_argument("--require-preemption", action="store_true", default=True)
-    ap.add_argument(
-        "--no-require-preemption", dest="require_preemption", action="store_false"
+        help="the warm replay must report at least this fraction of prompt "
+        "tokens served from LMCache, else it proves nothing",
     )
     ap.add_argument(
         "--near-tie-gap",
@@ -392,59 +492,40 @@ def main() -> int:
         "produced the runner-up token",
     )
     ap.add_argument(
-        "--noise-floor",
-        action="store_true",
-        default=True,
-        help="also run the baseline at replay concurrency and report its own "
-        "divergence count against the reference (informational)",
+        "--max-slowdown-percent",
+        type=float,
+        default=None,
+        help="fail if an LMCache high-concurrency pass is slower than its "
+        "baseline by more than this (unset: report only)",
     )
-    ap.add_argument("--no-noise-floor", dest="noise_floor", action="store_false")
+    ap.add_argument("--skip-unique", action="store_true", help="skip pass 2")
+    ap.add_argument("--skip-shared", action="store_true", help="skip passes 3 and 4")
     ap.add_argument("--output-dir", type=Path, default=Path("preemption_results"))
     args = ap.parse_args()
-
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    prompts = build_workload(
-        model=args.model,
-        num_requests=args.num_requests,
-        prompt_min=args.prompt_min,
-        prompt_max=args.prompt_max,
-        max_tokens=args.max_tokens,
-        num_shared_prefixes=args.shared_prefixes,
-        shared_prefix_len=args.shared_prefix_len,
-        vocab=args.vocab,
-        seed=args.seed,
-    )
-    demand = sum(len(p.token_ids) + p.max_tokens for p in prompts)
-    print(f"workload: {len(prompts)} requests, total KV demand {demand} tokens")
 
     failures: list[str] = []
+    results: list[PassResult] = []
 
-    baseline = asyncio.run(
-        run_pass(
-            "baseline",
-            args.baseline_url,
-            args.model,
-            prompts,
-            args.hot_concurrency,
-            False,
-            want_logprobs=True,
-        )
-    )
-    print(summarize(baseline))
-    if baseline.errors:
-        failures.append(f"baseline had {len(baseline.errors)} errors")
-    if not all(c.token_ids for c in baseline.completions.values() if not c.error):
-        failures.append(
-            "baseline returned no token ids; does this vLLM support return_token_ids?"
-        )
-    if not all(c.top2 for c in baseline.completions.values() if not c.error):
-        print(
-            "WARNING: baseline returned no top-2 logprobs; "
-            "every divergence counts as hard"
-        )
+    def record(result: PassResult) -> PassResult:
+        results.append(result)
+        print(summarize(result))
+        if result.errors:
+            failures.append(f"{result.name}: {len(result.errors)} errored requests")
+        if result.not_length_capped:
+            failures.append(
+                f"{result.name}: {len(result.not_length_capped)} requests did not "
+                f"finish with finish_reason=length"
+            )
+        if not result.drained:
+            failures.append(
+                f"{result.name}: server still reports running/waiting requests "
+                f"30 s after the last response"
+            )
+        return result
 
-    def judge(label: str, other: PassResult) -> None:
-        divergences, hard = compare(baseline, other)
+    def judge(label: str, reference: PassResult, other: PassResult) -> None:
+        divergences, hard = compare(reference, other)
         benign = [d for d in divergences if d.benign(args.near_tie_gap)]
         real = [d for d in divergences if not d.benign(args.near_tie_gap)]
         print(
@@ -456,93 +537,176 @@ def main() -> int:
         for line in hard:
             failures.append(f"{label}: {line}")
         if real:
-            failures.append(f"{label}: {len(real)} hard divergences from baseline")
+            failures.append(f"{label}: {len(real)} hard divergences from reference")
 
-    if args.noise_floor:
-        floor = asyncio.run(
-            run_pass(
-                "baseline-noise-floor",
-                args.baseline_url,
-                args.model,
-                prompts,
-                args.replay_concurrency,
-                False,
-            )
+    def slowdown(label: str, reference: PassResult, other: PassResult) -> None:
+        pct = (
+            (other.wall_s / reference.wall_s - 1.0) * 100.0 if reference.wall_s else 0.0
         )
-        print(summarize(floor))
-        divergences, _hard = compare(baseline, floor)
+        print(
+            f"    {label}: wall {other.wall_s:.1f}s vs baseline "
+            f"{reference.wall_s:.1f}s ({pct:+.1f}%)"
+        )
+        if args.max_slowdown_percent is not None and pct > args.max_slowdown_percent:
+            failures.append(
+                f"{label}: {pct:.1f}% slower than baseline "
+                f"(limit {args.max_slowdown_percent}%)"
+            )
+
+    def run(name: str, url: str, prompts: list[Prompt], conc: int, **kw) -> PassResult:
+        return record(asyncio.run(run_pass(name, url, args.model, prompts, conc, **kw)))
+
+    common = dict(
+        num_requests=args.num_requests,
+        prompt_min=args.prompt_min,
+        prompt_max=args.prompt_max,
+        max_tokens=args.max_tokens,
+        vocab=args.vocab,
+        seed=args.seed,
+    )
+    unique = build_workload(
+        args.model,
+        WorkloadSpec(
+            name="unique", num_shared_prefixes=0, shared_prefix_len=0, **common
+        ),
+    )
+    shared = build_workload(
+        args.model,
+        WorkloadSpec(
+            name="shared",
+            num_shared_prefixes=args.shared_prefixes,
+            shared_prefix_len=args.shared_prefix_len,
+            **common,
+        ),
+    )
+    for wl in (unique, shared):
+        demand = sum(len(p.token_ids) + p.max_tokens for p in wl)
+        label = wl[0].request_id.split("-")[0]
+        print(f"  {label} workload KV demand: {demand} tokens")
+
+    # ---- 1. references and A/A floors ----------------------------------------
+    refs: dict[str, PassResult] = {}
+    for label, wl in (("unique", unique), ("shared", shared)):
+        if (label == "unique" and args.skip_unique) or (
+            label == "shared" and args.skip_shared
+        ):
+            continue
+        ref = run(
+            f"baseline-{label}-hot",
+            args.baseline_url,
+            wl,
+            args.hot_concurrency,
+            want_cache_stats=False,
+            want_logprobs=True,
+        )
+        if not all(c.token_ids for c in ref.completions.values() if not c.error):
+            failures.append(f"{ref.name}: no token ids; vLLM lacks return_token_ids?")
+        if not all(c.top2 for c in ref.completions.values() if not c.error):
+            print("    WARNING: no top-2 logprobs; every divergence counts as hard")
+        refs[label] = ref
+        floor = run(
+            f"baseline-{label}-lowconc",
+            args.baseline_url,
+            wl,
+            args.replay_concurrency,
+            want_cache_stats=False,
+        )
+        divergences, _hard = compare(ref, floor)
         benign = sum(d.benign(args.near_tie_gap) for d in divergences)
         print(
-            f"    A/A noise floor (baseline hot vs baseline replay-concurrency): "
-            f"{len(divergences)} divergent, {benign} near-tie, "
-            f"{len(divergences) - benign} would count as hard"
+            f"    A/A floor ({label}): {len(divergences)} divergent, "
+            f"{benign} near-tie, {len(divergences) - benign} would count as hard"
         )
         for d in divergences[:5]:
             print("      ", d.describe(args.max_tokens))
 
-    for rnd in range(args.repeats):
-        hot = asyncio.run(
-            run_pass(
-                f"lmcache-hot-{rnd}",
-                args.lmcache_url,
-                args.model,
-                prompts,
-                args.hot_concurrency,
-                True,
-            )
+    # ---- 2. unique workload: ownership / resume-load -------------------------
+    if not args.skip_unique:
+        hot = run(
+            "lmcache-unique-hot",
+            args.lmcache_url,
+            unique,
+            args.hot_concurrency,
+            want_cache_stats=True,
         )
-        print(summarize(hot))
-        if hot.errors:
-            failures.append(f"T0 {hot.name}: {len(hot.errors)} errored requests")
-        if args.require_preemption and not hot.preemptions > 0:
-            failures.append(
-                f"T0 {hot.name}: no preemptions observed; workload too small"
-            )
-        judge(f"T2 {hot.name}", hot)
-
-        replay = asyncio.run(
-            run_pass(
-                f"lmcache-replay-{rnd}",
-                args.lmcache_url,
-                args.model,
-                prompts,
-                args.replay_concurrency,
-                True,
-            )
-        )
-        print(summarize(replay))
-        if replay.errors:
-            failures.append(f"T3 {replay.name}: {len(replay.errors)} errored requests")
-        cached = [
-            (c.lmcache_cached_tokens or 0) / len(p.token_ids)
-            for p in prompts
-            if (c := replay.completions.get(p.request_id)) is not None
+        if not hot.preemptions > 0:
+            failures.append(f"{hot.name}: no preemptions observed; workload too small")
+        served = [
+            c for c in hot.completions.values() if (c.lmcache_cached_tokens or 0) > 0
         ]
-        hit_fraction = sum(cached) / len(cached) if cached else 0.0
-        print(f"    replay LMCache hit fraction of prompt tokens: {hit_fraction:.2f}")
-        if hit_fraction < args.min_replay_hit_fraction:
-            failures.append(
-                f"T3 {replay.name}: replay hit fraction {hit_fraction:.2f} < "
-                f"{args.min_replay_hit_fraction}; the replay did not exercise the cache"
-            )
-        judge(f"T3 {replay.name}", replay)
-
-        for res in (hot, replay):
-            with open(args.output_dir / f"{res.name}.json", "w") as f:
-                json.dump(
-                    {rid: c.__dict__ for rid, c in res.completions.items()}, f, indent=1
-                )
-    with open(args.output_dir / "baseline.json", "w") as f:
-        json.dump(
-            {rid: c.__dict__ for rid, c in baseline.completions.items()}, f, indent=1
+        print(
+            f"    resume-load: {len(served)}/{len(hot.completions)} requests loaded "
+            f"KV from LMCache on a cold cache with unique prompts; every such load "
+            f"is a preempted request reading its own earlier KV"
         )
+        if not served:
+            failures.append(
+                f"{hot.name}: no request loaded KV from LMCache despite "
+                f"{hot.preemptions:.0f} preemptions; resume-load is not working"
+            )
+        judge(f"T2/T6 {hot.name}", refs["unique"], hot)
+        slowdown(f"T1 {hot.name}", refs["unique"], hot)
+
+    # ---- 3 + 4. shared workload: reuse under preemption, then warm replay ----
+    if not args.skip_shared:
+        for rnd in range(args.repeats):
+            hot = run(
+                f"lmcache-shared-hot-{rnd}",
+                args.lmcache_url,
+                shared,
+                args.hot_concurrency,
+                want_cache_stats=True,
+            )
+            if not hot.preemptions > 0:
+                failures.append(
+                    f"{hot.name}: no preemptions observed; workload too small"
+                )
+            judge(f"T2 {hot.name}", refs["shared"], hot)
+            slowdown(f"T1 {hot.name}", refs["shared"], hot)
+
+            replay = run(
+                f"lmcache-shared-replay-{rnd}",
+                args.lmcache_url,
+                shared,
+                args.replay_concurrency,
+                want_cache_stats=True,
+            )
+            if replay.preemptions > 0:
+                failures.append(
+                    f"{replay.name}: {replay.preemptions:.0f} preemptions during the "
+                    f"low-concurrency replay; raise the pool or lower concurrency"
+                )
+            cached = [
+                (c.lmcache_cached_tokens or 0) / len(p.token_ids)
+                for p in shared
+                if (c := replay.completions.get(p.request_id)) is not None
+            ]
+            hit_fraction = sum(cached) / len(cached) if cached else 0.0
+            print(
+                f"    replay LMCache hit fraction of prompt tokens: {hit_fraction:.2f}"
+            )
+            if hit_fraction < args.min_replay_hit_fraction:
+                failures.append(
+                    f"{replay.name}: hit fraction {hit_fraction:.2f} < "
+                    f"{args.min_replay_hit_fraction}; the replay did not read the cache"
+                )
+            judge(f"T3 {replay.name}", refs["shared"], replay)
+
+    for res in results:
+        with open(args.output_dir / f"{res.name}.json", "w") as f:
+            json.dump(
+                {rid: c.__dict__ for rid, c in res.completions.items()}, f, indent=1
+            )
 
     if failures:
         print("FAILED:")
         for line in failures:
             print("  -", line)
         return 1
-    print("PASSED: T0 no crash, T2 hot outputs match, T3 replay outputs match")
+    print(
+        "PASSED: no crash or wedge, unique-prompt resume-load matches the reference, "
+        "shared-prefix hot pass matches, warm replay matches"
+    )
     return 0
 
 
